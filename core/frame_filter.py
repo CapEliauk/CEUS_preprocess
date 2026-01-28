@@ -1,5 +1,5 @@
 """
-帧筛选模块 - 内存优化版本 (迭代式处理)
+帧筛选模块
 """
 import numpy as np
 import cv2
@@ -19,7 +19,7 @@ logger = get_logger('frame_filter')
 
 
 class FrameFilter:
-    """帧筛选器 - 内存优化版"""
+    """帧筛选器"""
 
     def __init__(self):
         self.ssim_threshold = config.filter.SSIM_THRESHOLD

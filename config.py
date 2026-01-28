@@ -14,6 +14,8 @@ class VideoConfig:
     CLIP_SIZE: Tuple[int, int] = (224, 224)
     CLIP_LENGTH: int = 16
     SLIDING_WINDOW_STRIDE: int = 8
+    DEFAULT_FPS: float = 25.0                                                     # 标准视频帧率（默认OpenCV读取）
+    DEFAULT_FPS_DICOM: float = 25.0                                               # dicom帧率（默认pydicom读取）
     OUTPUT_FORMAT: str = '.mp4'
     OUTPUT_FPS: int = 30
     VIDEO_EXTENSIONS: Tuple[str, ...] = ('.avi', '.mp4', '.mkv', '.mov', '.wmv')
@@ -86,14 +88,18 @@ class MemoryConfig:
     USE_MEMMAP: bool = True
     MEMMAP_THRESHOLD_MB: int = 500  # 超过此大小使用memmap
     MAX_WORKERS: int = 2
-
+    WAIT_MEMORY_TIMEOUT: float = 30.0
+    MONITOR_INTERNAL: float = 1.0
+    TEMP_DIR: str = os.path.join(PROJECT_ROOT, 'temp')
 
 @dataclass
 class LogConfig:
     """日志配置"""
     LOG_DIR: str = os.path.join(PROJECT_ROOT, 'logs')
     LOG_LEVEL: str = 'DEBUG'
+    CONSOLE_LOG_LEVEL: str = 'INFO'
     LOG_FORMAT: str = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    LOG_DATE_FORMAT: str = '%Y-%m-%d %H:%M:%S'
     MAX_LOG_FILES: int = 10
     MAX_LOG_SIZE_MB: int = 10
 

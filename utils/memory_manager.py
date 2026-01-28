@@ -20,7 +20,7 @@ class MemmapManager:
     """内存映射管理器"""
 
     def __init__(self):
-        self._temp_dir = tempfile.mkdtemp(prefix='ceus_memmap_')
+        self._temp_dir = tempfile.mkdtemp(prefix='ceus_memmap_', dir=config.memory.TEMP_DIR)
         self._files: Dict[str, str] = {}
         self._arrays: Dict[str, np.memmap] = {}
         self._lock = threading.Lock()
@@ -163,7 +163,7 @@ class MemoryManager:
         gc.collect()
         logger.debug(f"执行GC，当前内存: {self.get_system_memory_percent():.1f}%")
 
-    def wait_for_memory(self, timeout: float = 30.0) -> bool:
+    def wait_for_memory(self, timeout: float = config.memory.WAIT_MEMORY_TIMEOUT) -> bool:
         """等待内存释放"""
         start = time.time()
         while self.is_memory_critical():
@@ -178,7 +178,7 @@ class MemoryManager:
         """注册内存警告回调"""
         self._callbacks.append(callback)
 
-    def start_monitoring(self, interval: float = 1.0):
+    def start_monitoring(self, interval: float = config.memory.MONITOR_INTERNAL):
         """启动监控"""
         if self._monitoring:
             return

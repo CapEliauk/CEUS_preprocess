@@ -3,6 +3,7 @@
 """
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Generator, Tuple
 import cv2
@@ -35,9 +36,13 @@ def find_video_files(root_dir: str) -> Generator[Tuple[str, str], None, None]:
 def is_dicom_file(filepath: str) -> bool:
     """检查是否为DICOM文件"""
     try:
-        with open(filepath, 'rb') as f:
-            f.seek(128)
-            return f.read(4) == b'DICM'
+        # 前置检查：文件长度不足132字节 -> 不可能是DICOM文件
+        if Path(filepath).stat().st_size < 132:
+            return False
+        else:
+            with open(filepath, 'rb') as f:
+                f.seek(128)
+                return f.read(4) == b'DICM'
     except:
         return False
 
@@ -54,6 +59,24 @@ def get_output_filename(original_name: str, phase: str, clip_idx: int) -> str:
     stem = Path(original_name).stem
     return f"{stem}_{phase}_clip{clip_idx:04d}{config.video.OUTPUT_FORMAT}"
 
+def remove_path(path: str) -> bool:
+    """
+    安全删除文件或文件夹
+    :param path: 要删除的路径
+    :return:
+    """
+    try:
+        if os.path.exists(path):
+            if os.path.isfile(path):
+                os.remove(path)
+            elif os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True) # ignore_errors防止因文件占用报错崩溃
+            logger.info(f"已清理临时文件: {path}")
+            return True
+        return True
+    except Exception as e:
+        logger.error(f"清理临时文件失败{path}：{e}")
+        return False
 
 def sanitize_filename(name: str) -> str:
     """清理文件名"""

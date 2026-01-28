@@ -41,11 +41,16 @@ class LoggerManager:
             encoding='utf-8'
         )
         file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(logging.Formatter(config.log.LOG_FORMAT))
+        file_handler.setFormatter(
+            logging.Formatter(
+                fmt=config.log.LOG_FORMAT,
+                datefmt=config.log.LOG_DATE_FORMAT
+            )
+        )
 
-        # 控制台处理器（只显示INFO及以上）
+        # 控制台处理器
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
+        console_handler.setLevel(getattr(logging, config.log.CONSOLE_LOG_LEVEL))
         console_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
 
         root_logger.addHandler(file_handler)
