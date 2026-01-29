@@ -78,37 +78,38 @@ class TICAnalyzer:
 
         logger.debug(f"TIC分析器初始化，fps={fps}")
 
-    def extract_roi_intensities_batch(self, frames: np.ndarray,
-                                      mask: np.ndarray) -> np.ndarray:
+
+    def extract_roi_intensities_batch(self, frames: list, mask: np.ndarray) -> np.ndarray:
         """
-        批量提取ROI强度 - 内存优化版
-        先Mask后计算，避免创建全图的灰度副本
+        批量提取ROI强度
         """
         mask_bool = mask > 0
-
         if not np.any(mask_bool):
             return np.zeros(len(frames))
 
-        # --- 内存优化关键点 ---
-        if frames.ndim == 4:
-            # 1. 先只提取 ROI 区域的 RGB 像素 (N, P, 3)，P是ROI像素数
-            # 这比 (N, H, W, 3) 小得多
-            roi_pixels_rgb = frames[:, mask_bool, :]
+        intensities = []
 
-            # 2. 转换为 float32 (N, P, 3)
-            roi_pixels_float = roi_pixels_rgb.astype(np.float32)
+        # [修改处] 改为循环逐帧处理，不要用 np.stack(frames)
+        for frame in frames:
+            # 只提取 ROI 区域的像素，大幅减少内存
+            roi_pixels = frame[mask_bool]
 
-            # 3. 仅对 ROI 区域进行灰度转换 (N, P)
-            # 使用标准的 BGR 转 Gray 公式: B*0.114 + G*0.587 + R*0.299
-            roi_pixels_gray = np.dot(roi_pixels_float, [0.114, 0.587, 0.299])
+            if roi_pixels.size == 0:
+                intensities.append(0.0)
+                continue
 
-            # 4. 计算均值 (N,)
-            return np.mean(roi_pixels_gray, axis=1)
+            # 如果是彩色 (N, 3)，手动计算灰度均值，避免全图转 float32
+            if roi_pixels.ndim == 2 and roi_pixels.shape[1] == 3:
+                # 先求所有像素的平均颜色 (3,)
+                mean_bgr = np.mean(roi_pixels, axis=0)
+                # 再转灰度: B*0.114 + G*0.587 + R*0.299
+                intensity = 0.114 * mean_bgr[0] + 0.587 * mean_bgr[1] + 0.299 * mean_bgr[2]
+            else:
+                intensity = np.mean(roi_pixels)
 
-        else:
-            # 如果已经是灰度图 (N, H, W)
-            roi_pixels = frames[:, mask_bool]
-            return np.mean(roi_pixels.astype(np.float32), axis=1)
+            intensities.append(intensity)
+
+        return np.array(intensities)
 
     def extract_roi_intensity_single(self, frame: np.ndarray,
                                       mask: np.ndarray) -> float:

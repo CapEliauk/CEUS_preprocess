@@ -279,6 +279,11 @@ class MainWindow(QMainWindow):
             self.current_task = None
             self.current_video_label.setText("当前视频: 全部标注完成")
             self.step_label.setText("步骤: 等待处理完成")
+
+            if self.video_loader:
+                self.video_loader.release()
+                self.video_loader = None
+
             return
 
         self.current_task = task

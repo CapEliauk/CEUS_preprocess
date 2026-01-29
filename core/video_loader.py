@@ -143,7 +143,8 @@ class StandardVideoLoader(VideoLoader):
     def release(self):
         """释放资源"""
         with self._lock:
-            self._buffer.clear()
+            if hasattr(self, "_buffer"):
+                self._buffer.clear()
             if self._cap:
                 self._cap.release()
         logger.debug(f"视频资源已释放: {self.filepath}")
@@ -161,7 +162,7 @@ class DicomVideoLoader(VideoLoader):
         # 读取 Header (不立刻读取 pixel_data)
         # stop_before_pixels=True 可以避免立刻加载大文件
         try:
-            self._ds = pydicom.dcmread(filepath, stop_before_pixels=False)
+            self._ds = pydicom.dcmread(filepath, stop_before_pixels=True)
         except Exception as e:
             logger.error(f"DICOM读取失败: {e}")
             raise
@@ -214,98 +215,97 @@ class DicomVideoLoader(VideoLoader):
 
     def _get_pixel_generator(self) -> Generator[np.ndarray, None, None]:
         """
-        创建一个生成器，逐帧产出像素数据，严格避免全量解压。
+        创建一个生成器，逐帧产出像素数据。
+        如果因为内存优化导致 PixelData 未加载，这里会临时加载。
         """
-        # 获取图像的基本信息
-        samples_per_pixel = getattr(self._ds, 'SamplesPerPixel', 1)
-        bits_allocated = getattr(self._ds, 'BitsAllocated', 16)
+        import pydicom.encaps
+        # 1. 确定数据源
+        # 如果 __init__ 中使用了 stop_before_pixels=True，这里 self._ds 可能没有 PixelData
+        # 我们需要一个临时的 dataset 来读取像素
+        temp_ds = None
+        if not hasattr(self._ds, 'PixelData'):
+            try:
+                # 临时读取完整文件 (会产生瞬间内存峰值，但随着生成器结束会释放)
+                temp_ds = pydicom.dcmread(self.filepath)
+                ds_source = temp_ds
+            except Exception as e:
+                logger.error(f"临时读取DICOM像素失败: {e}")
+                return
+        else:
+            ds_source = self._ds
 
-        # 判断是否为压缩格式 (TransferSyntaxUID)
-        # 显式检查 file_meta，如果缺失则尝试从 dataset 获取或默认为非压缩
+        # 2. 获取图像的基本信息 (从数据源获取)
+        samples_per_pixel = getattr(ds_source, 'SamplesPerPixel', 1)
+        bits_allocated = getattr(ds_source, 'BitsAllocated', 16)
+        num_frames = getattr(ds_source, "NumberOfFrames", 1)
+
+        # 3. 判断压缩格式
         is_compressed = False
         try:
-            is_compressed = self._ds.file_meta.TransferSyntaxUID.is_compressed
+            # 优先看 file_meta
+            if hasattr(ds_source, 'file_meta'):
+                is_compressed = ds_source.file_meta.TransferSyntaxUID.is_compressed
+            # 如果没有，尝试推断 (只要 PixelData 是封装序列通常就是压缩的)
         except (AttributeError, ValueError):
-            # 如果无法判断，通常默认为未压缩，除非 PixelData 是封装格式
             pass
 
-        # === 分支 1: 处理压缩数据 (JPEG, RLE 等) ===
-        if is_compressed:
-            import pydicom.encaps
+        try:
+            # === 分支 1: 处理压缩数据 (JPEG, RLE 等) ===
+            if is_compressed:
+                if hasattr(ds_source, 'PixelData'):
+                    frame_gen = pydicom.encaps.generate_pixel_data_frame(ds_source.PixelData, num_frames)
 
-            # 获取帧数
-            num_frames = getattr(self._ds, "NumberOfFrames", 1)
+                    for frame_bytes in frame_gen:
+                        arr = np.frombuffer(frame_bytes, np.uint8)
+                        frame = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
 
-            # 使用 pydicom 的生成器获取每一帧的压缩字节流
-            # 这不会解压数据，内存占用极低
-            if 'PixelData' in self._ds:
-                frame_gen = pydicom.encaps.generate_pixel_data_frame(self._ds.PixelData, num_frames)
-            else:
-                logger.error("DICOM 文件缺少 PixelData")
-                return
-
-            for frame_bytes in frame_gen:
-                # 使用 OpenCV 直接解码内存中的压缩字节流
-                # 这比 pydicom 的解压机制更轻量，且天然支持单帧解码
-                arr = np.frombuffer(frame_bytes, np.uint8)
-
-                # cv2.IMREAD_UNCHANGED 会根据数据深度自动处理 (如 16位图像)
-                # cv2 解码默认为 BGR 顺序，这正好符合 VideoLoader 的需求
-                frame = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
-
-                if frame is not None:
-                    yield frame
+                        if frame is not None:
+                            yield frame
+                        else:
+                            logger.warning("单帧解码失败，返回黑帧")
+                            yield np.zeros((self.height, self.width, 3 if samples_per_pixel == 3 else 1),
+                                           dtype=np.uint8)
                 else:
-                    # 如果 cv2 解码失败 (例如特殊的 RLE 格式)，这里可以记录警告
-                    # 为了防止崩溃，返回一个黑帧
-                    logger.warning("单帧解码失败，跳过该帧")
-                    yield np.zeros((self.height, self.width, 3 if samples_per_pixel == 3 else 1), dtype=np.uint8)
+                    logger.error("无法获取 PixelData (压缩格式)")
 
-        # === 分支 2: 处理未压缩数据 (Raw Data) ===
-        else:
-            # 确定数据类型
-            if bits_allocated == 8:
-                dtype = np.uint8
-            elif bits_allocated == 16:
-                dtype = np.uint16
+            # === 分支 2: 处理未压缩数据 (Raw Data) ===
             else:
-                logger.error(f"不支持的位深: {bits_allocated}")
-                return
+                if bits_allocated == 8:
+                    dtype = np.uint8
+                elif bits_allocated == 16:
+                    dtype = np.uint16
+                else:
+                    logger.error(f"不支持的位深: {bits_allocated}")
+                    return
 
-            # 使用 frombuffer 创建内存视图，这不会复制数据，只是创建了一个指向它的指针
-            try:
-                # 注意：pydicom 读取时如果是 Implicit VR，PixelData 可能是 bytes
-                pixel_data = self._ds.PixelData
+                pixel_data = ds_source.PixelData
                 full_arr = np.frombuffer(pixel_data, dtype=dtype)
-            except Exception as e:
-                logger.error(f"无法创建内存视图: {e}")
-                return
 
-            # 计算单帧的大小 (元素个数)
-            frame_size = self.height * self.width * samples_per_pixel
-            num_frames = getattr(self._ds, "NumberOfFrames", 1)
+                frame_size = self.height * self.width * samples_per_pixel
 
-            # 确保数据长度足够
-            if full_arr.size < frame_size * num_frames:
-                logger.warning("PixelData 数据长度不足，可能文件损坏")
-                num_frames = full_arr.size // frame_size
+                # 长度校验
+                if full_arr.size < frame_size * num_frames:
+                    num_frames = full_arr.size // frame_size
 
-            # 逐帧切片 yield
-            for i in range(num_frames):
-                start = i * frame_size
-                end = (i + 1) * frame_size
+                for i in range(num_frames):
+                    start = i * frame_size
+                    end = (i + 1) * frame_size
+                    frame_flat = full_arr[start:end]
 
-                # 切片操作也是视图，不占用额外内存
-                frame_flat = full_arr[start:end]
+                    if samples_per_pixel == 3:
+                        frame = frame_flat.reshape((self.height, self.width, 3))
+                    else:
+                        frame = frame_flat.reshape((self.height, self.width))
 
-                # Reshape 为图像矩阵
-                if samples_per_pixel == 3:
-                    # DICOM Raw 通常是 RGB，后续可能需要转 BGR
-                    frame = frame_flat.reshape((self.height, self.width, 3))
-                else:
-                    frame = frame_flat.reshape((self.height, self.width))
+                    yield frame
 
-                yield frame
+        finally:
+            # 生成器结束或中断时，确保释放临时对象
+            if temp_ds is not None:
+                del temp_ds
+            # 强制回收一次，确保大数组内存被标记为可回收
+            # (注意：频繁调用gc有性能开销，但在这种IO密集型操作结束时调用是划算的)
+            pass
 
     def _load_to_memmap(self):
         """将数据处理后写入 Memmap，并及时释放内存"""
@@ -348,6 +348,8 @@ class DicomVideoLoader(VideoLoader):
         self._frames.flush()
 
         # 删除 ds 中的 pixel_array 缓存（如果有）
+        if hasattr(self._ds, 'PixelData'):
+            del self._ds.PixelData
         if hasattr(self._ds, "_pixel_array"):
             del self._ds._pixel_array
         self._memory.force_gc()
@@ -383,7 +385,10 @@ class DicomVideoLoader(VideoLoader):
 
     def release(self):
         """释放资源"""
-        self._memory.memmap.cleanup()
+        if hasattr(self, '_memmap_key'):
+            self._memory.memmap.delete_memmap(self._memmap_key)
+        else:
+            self._memory.memmap.cleanup()
         self._ds = None
         gc.collect()
 
