@@ -13,7 +13,7 @@ from config import config
 from core.video_loader import VideoLoader, FrameData, create_frame_producer
 from core.tic_analyzer import TICAnalyzer, TICFitResult
 from core.frame_filter import FrameFilter
-from core.clip_generator import ClipGenerator, Clip, ROIBoundingBox
+from core.clip_generator import ClipGenerator, ROIBoundingBox
 from core.roi_manager import DualRegionROIManager
 from utils.memory_manager import MemoryManager
 from utils.logger import get_logger
@@ -55,6 +55,12 @@ class VideoPipeline:
         self.memory = MemoryManager()
 
         self._stop_flag = threading.Event()
+
+        self.manual_anchor_frame = None
+
+    def set_anchor_frame(self, frame: np.ndarray):
+        """接受GUI传来的B-mode基准帧"""
+        self.manual_anchor_frame = frame
 
     def stop(self):
         """停止处理"""
@@ -169,61 +175,61 @@ class VideoPipeline:
     def _process_phase(self, loader: VideoLoader, phase: str,
                        start_t: float, end_t: float,
                        bbox: ROIBoundingBox, output_dir: str) -> int:
-        """处理单个相位"""
+
+        # 1. 提取该相位的所有帧
         start_f = int(start_t * loader.fps)
-        end_f = min(int(end_t * loader.fps), loader.frame_count)
+        end_f = int(end_t * loader.fps)
 
-        # 收集相位帧
-        phase_frames = []
-        phase_indices = []
+        # 注意：这里需要同时拿 B-mode (用来筛选) 和 CEUS (用来训练)
+        # 假设 loader.get_dual_frames(i) 能返回 (b_frame, c_frame)
+        # 如果你现在的 loader 只能返回一种，你需要去修改 video_loader 让它支持返回双幅
+        # 这里假设你已经有办法拿到两个列表：
+        b_frames_list = []
+        c_frames_list = []
+        original_indices = []
 
-        for frame_data in loader.iter_frames(start_f, end_f, step=2):
-            if self._stop_flag.is_set():
-                break
+        for i in range(start_f, end_f, 2):  # step=2 降采样一点没关系
+            frame_data = loader.get_frame(i)  # 假设这里能拿到双幅
+            if frame_data is None: continue
 
-            # 运动补偿
-            frame, mask = self.roi_manager.process_frame(frame_data.frame)
-            phase_frames.append(frame)
-            phase_indices.append(frame_data.index)
+            # 这里你需要自己实现一下 split_dual_view
+            # 通常是 frame[:, :width//2] 和 frame[:, width//2:]
+            b_img, c_img = self.split_dual_view(frame_data)
 
-            if self.memory.is_memory_critical():
-                self.memory.wait_for_memory()
+            b_frames_list.append(b_img)
+            c_frames_list.append(c_img)
+            original_indices.append(i)
 
-        if len(phase_frames) < config.video.CLIP_LENGTH:
+        if len(b_frames_list) < 16:
             return 0
 
-        # 筛选帧
-        filtered, valid_idx = self.filter.filter_frames(
-            phase_frames, self.roi_manager.mask
+        # 2. 呼吸门控筛选 (在 B-mode 上做)
+        # 这里的 mask 应该是 B-mode 侧的 mask
+        peak_indices = self.filter.filter_by_respiration(b_frames_list, self.roi_manager.mask, self.manual_anchor_frame)
+
+        # 3. VideoMAE 采样 (取16帧)
+        final_indices_local = self.filter.sample_for_videomae(peak_indices)
+
+        # 4. 提取最终数据
+        final_c_frames = [c_frames_list[i] for i in final_indices_local]
+        final_timestamps = [original_indices[i] / loader.fps for i in final_indices_local]
+
+        # 5. 保存
+        success = self.generator.save_training_sample(
+            frames=final_c_frames,
+            timestamps=final_timestamps,
+            roi_mask=self.roi_manager.mask,  # 注意：这是B-mode mask，如果左右对称可以直接用
+            case_id=os.path.basename(loader.filepath).split('.')[0],
+            phase_name=phase
         )
 
-        if len(filtered) < config.video.CLIP_LENGTH:
-            return 0
+        return 1 if success else 0
 
-        filtered_indices = [phase_indices[i] for i in valid_idx]
-
-        # 生成clips
-        clip_count = 0
-        for clip in self.generator.generate_clips(
-                filtered, filtered_indices, bbox, self.analyzer
-        ):
-            if self._stop_flag.is_set():
-                break
-
-            clip.phase = phase
-            filename = f"{phase}_clip{clip_count:04d}{config.video.OUTPUT_FORMAT}"
-            output_path = os.path.join(output_dir, filename)
-
-            self.generator.save_clip(clip, output_path, loader.fps)
-            self.signals.clip_generated.emit(loader.filepath, phase, clip_count)
-
-            clip_count += 1
-
-        # 清理
-        del phase_frames, filtered
-        self.memory.force_gc()
-
-        return clip_count
+    def split_dual_view(self, frame):
+        # 简单的左右分割辅助函数
+        h, w = frame.shape[:2]
+        mid = w // 2
+        return frame[:, :mid], frame[:, mid:]
 
     def _emit_progress(self, video_path: str, percent: int, message: str):
         """发送进度信号"""

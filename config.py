@@ -62,6 +62,9 @@ class FilterConfig:
     # 快速筛选
     USE_FAST_FILTER: bool = True
 
+    PEAK_DISTANCE: int = 5              # 最小峰值距离
+    TARGET_FRAMES: int = 16             # 需要固定的帧数
+
 
 @dataclass
 class RegistrationConfig:
@@ -82,7 +85,7 @@ class RegistrationConfig:
 @dataclass
 class MemoryConfig:
     """内存管理参数"""
-    MAX_MEMORY_PERCENT: float = 70.0
+    MAX_MEMORY_PERCENT: float = 85.0
     BATCH_SIZE: int = 50
     FRAME_BUFFER_SIZE: int = 100
     USE_MEMMAP: bool = True

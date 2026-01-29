@@ -39,6 +39,14 @@ class VideoProcessorWorker(QObject):
 
         self._memory = MemoryManager()
 
+        self.manual_anchor_frame = None
+
+
+    def set_anchor_frame(self, frame: np.ndarray):
+        """设置人工呼吸基准帧"""
+        self.manual_anchor_frame = frame
+        logger.info("Worker 已接收人工基准帧")
+
     def start(self):
         self._running = True
         logger.info("处理工作器启动")
@@ -94,6 +102,14 @@ class VideoProcessorWorker(QObject):
         self.progress_updated.emit(video_path, 0, "Loading video...")
         loader = create_video_loader(video_path)
 
+        anchor_idx = getattr(task, "selected_frame_idx", 0)
+        manual_anchor_frame = loader.get_frame(anchor_idx)
+
+        if manual_anchor_frame is not None:
+            logger.info(f"成功加载基准帧 (Index: {anchor_idx})")
+        else:
+            logger.warning(f"无法加载基准帧 (Index: {anchor_idx})，将导致处理跳过")
+
         # 区域配置
         bmode_rect = RegionRect.from_tuple(task.bmode_rect)
         ceus_rect = RegionRect.from_tuple(task.ceus_rect)
@@ -103,7 +119,7 @@ class VideoProcessorWorker(QObject):
 
         # 计算CEUS区域内ROI的最小外接矩形
         ceus_local_mask = self._extract_ceus_local_mask(ceus_roi_mask, ceus_rect, task.frame_shape)
-        roi_bbox = ROIBoundingBox.from_contours(ceus_local_mask, padding=10)
+        roi_bbox = ROIBoundingBox.from_mask(ceus_local_mask, padding=10)
 
         logger.info(f"CEUS区域: {ceus_rect.to_tuple()}, ROI bbox: {roi_bbox}")
 
@@ -144,11 +160,11 @@ class VideoProcessorWorker(QObject):
 
         # 帧筛选和clip生成
         filter_ = FrameFilter()
-        generator = ClipGenerator()
+        generator = ClipGenerator(task.output_dir)
 
-        output_dir = create_output_structure(
-            os.path.dirname(video_path), task.output_dir, task.relative_path
-        )
+        # output_dir = create_output_structure(
+        #     os.path.dirname(video_path), task.output_dir, task.relative_path
+        # )
 
         total_clips = 0
         phase_idx = 0
@@ -164,62 +180,87 @@ class VideoProcessorWorker(QObject):
             start_f = int(start_t * loader.fps)
             end_f = min(int(end_t * loader.fps), loader.frame_count)
 
-            # 收集帧
-            phase_bmode_frames = []
-            phase_ceus_frames = []
-            phase_indices = []
+            # === 第一遍扫描 (Pass 1): 只算分，不存图 ===
+            logger.info(f"{phase}期: Pass 1 - 计算呼吸曲线...")
 
+            ssim_scores = []
+            valid_global_indices = []  # 记录实际的帧号
+
+            # 1. 准备基准帧数据 (预处理一次，重复使用)
+            if manual_anchor_frame is not None:
+                # 裁剪 B-mode 区域作为基准
+                anchor_frame_bmode = bmode_rect.crop(manual_anchor_frame)
+                anchor_processed = filter_.prepare_anchor(anchor_frame_bmode, task.bmode_roi_mask)
+            else:
+                # 如果没有基准帧，随便拿第一帧顶替 (或者跳过)
+                logger.warning("未设置人工基准帧，跳过呼吸筛选")
+                continue
+
+            # 2. 流式遍历 (内存占用极低)
             for frame_data in loader.iter_frames(start_f, end_f, step=2):
                 if self._memory.is_memory_critical():
                     self._memory.wait_for_memory()
 
-                # 分别提取两个区域
+                # 提取 B-mode
                 bmode_frame = bmode_rect.crop(frame_data.frame)
-                ceus_frame = ceus_rect.crop(frame_data.frame)
 
-                phase_bmode_frames.append(bmode_frame)
-                phase_ceus_frames.append(ceus_frame)
-                phase_indices.append(frame_data.index)
+                # 计算 SSIM 并立即丢弃图像
+                score = filter_.compute_single_ssim(bmode_frame, anchor_processed, task.bmode_roi_mask)
 
-            if len(phase_bmode_frames) < config.video.CLIP_LENGTH:
+                ssim_scores.append(score)
+                valid_global_indices.append(frame_data.index)
+
+                # 显式删除引用，加速回收
+                del bmode_frame
+
+            if len(ssim_scores) < config.video.CLIP_LENGTH:
                 continue
 
-            # 在B-mode区域使用SSIM筛选
-            bmode_mask = task.bmode_roi_mask
-            _, valid_idx = filter_.filter_frames(phase_bmode_frames, bmode_mask)
+            # === 索引选择 ===
+            # 1. 找波峰 (在 scores 列表里找，返回的是局部索引 0, 1, 2...)
+            peak_local_indices = filter_.find_peaks_from_scores(ssim_scores)
 
-            if len(valid_idx) < config.video.CLIP_LENGTH:
+            # 2. 映射回全局帧号
+            peak_global_indices = [valid_global_indices[i] for i in peak_local_indices]
+
+            # 3. VideoMAE 采样 (选出最终的 16 个帧号)
+            final_global_indices = filter_.sample_for_videomae(peak_global_indices)
+
+            if len(final_global_indices) == 0:
                 continue
 
-            # 使用相同索引获取CEUS帧
-            filtered_ceus = [phase_ceus_frames[i] for i in valid_idx]
-            filtered_indices = [phase_indices[i] for i in valid_idx]
+            # === 第二遍扫描 (Pass 2): 精准读取 (只读16帧) ===
+            logger.info(f"{phase}期: Pass 2 - 提取样本帧...")
 
-            # 在CEUS区域生成clips - 使用ROI最小外接矩形裁剪到224x224
-            clip_count = 0
-            for clip in generator.generate_clips(
-                frames=filtered_ceus,
-                indices=filtered_indices,
+            final_ceus_frames = []
+            final_timestamps = []
+
+            # 使用随机访问接口 get_frame
+            for idx in final_global_indices:
+                frame = loader.get_frame(idx)
+                if frame is None: continue
+
+                # 提取 CEUS
+                ceus_frame = ceus_rect.crop(frame)
+                final_ceus_frames.append(ceus_frame)
+
+                # 记录时间戳
+                final_timestamps.append(idx / loader.fps)
+
+            # === 保存 ===
+            ceus_local_mask = self._extract_ceus_local_mask(task.ceus_roi_mask, ceus_rect, task.frame_shape)
+
+            success = generator.save_training_sample(
+                frames=final_ceus_frames,
+                timestamps=final_timestamps,
                 roi_mask=ceus_local_mask,
-                analyzer=analyzer,
-                padding=10,
-                make_square=True
-            ):
-                if not self._running:
-                    break
+                case_id=os.path.basename(video_path).split('.')[0],
+                phase_name=phase
+            )
 
-                clip.phase = phase
-                filename = get_output_filename(os.path.basename(video_path), phase, clip_count)
-                output_path = os.path.join(output_dir, filename)
+            if success:
+                total_clips += 1
 
-                if generator.save_clip(clip, output_path, loader.fps):
-                    clip_count += 1
-                    total_clips += 1
-
-            logger.info(f"{phase}期: 生成 {clip_count} 个clips")
-
-            # 清理内存
-            del phase_bmode_frames, phase_ceus_frames, filtered_ceus
             self._memory.force_gc()
 
         loader.release()

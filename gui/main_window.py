@@ -265,6 +265,7 @@ class MainWindow(QMainWindow):
         # 启动后台线程
         if self.worker_thread is None or not self.worker_thread.isRunning():
             self.worker_thread = VideoProcessorThread(self.worker)
+            self.worker.moveToThread(self.worker_thread)
             self.worker_thread.start()
 
         self.start_btn.setEnabled(False)
